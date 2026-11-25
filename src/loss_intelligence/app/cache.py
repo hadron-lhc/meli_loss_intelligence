@@ -93,6 +93,25 @@ def hotspots(
 
 
 @st.cache_data(ttl=TTL_SECONDS, show_spinner=False)
+def hotspot_drilldown(
+    database: str,
+    scope_type: str,
+    scope_id: str,
+    start_date: date | None,
+    end_date: date | None,
+    limit: int = 25,
+) -> dict[str, Any]:
+    return repository.hotspot_drilldown(
+        engine(database),
+        scope_type,
+        scope_id,
+        start_date,
+        end_date,
+        limit=limit,
+    )
+
+
+@st.cache_data(ttl=TTL_SECONDS, show_spinner=False)
 def loss_by_currency(
     database: str,
     start_date: date | None,
@@ -165,9 +184,17 @@ def alerts_without_active_investigation(
 def shipment_search(
     database: str,
     query: str | None,
+    status: str | None = None,
+    damaged_only: bool = False,
     limit: int = 25,
 ) -> list[dict[str, Any]]:
-    return repository.shipment_search(engine(database), query, limit=limit)
+    return repository.shipment_search(
+        engine(database),
+        query,
+        status=status,
+        damaged_only=damaged_only,
+        limit=limit,
+    )
 
 
 @st.cache_data(ttl=TTL_SECONDS, show_spinner=False)
@@ -183,6 +210,11 @@ def shipment_events(database: str, shipment_id: UUID) -> list[dict[str, Any]]:
 @st.cache_data(ttl=TTL_SECONDS, show_spinner=False)
 def shipment_incidents(database: str, shipment_id: UUID) -> list[dict[str, Any]]:
     return repository.shipment_incidents(engine(database), shipment_id)
+
+
+@st.cache_data(ttl=TTL_SECONDS, show_spinner=False)
+def shipment_returns(database: str, shipment_id: UUID) -> list[dict[str, Any]]:
+    return repository.shipment_returns(engine(database), shipment_id)
 
 
 @st.cache_data(ttl=TTL_SECONDS, show_spinner=False)
@@ -227,6 +259,11 @@ def returns_summary(
     end_date: date | None,
 ) -> dict[str, Any]:
     return repository.returns_summary(engine(database), start_date, end_date)
+
+
+@st.cache_data(ttl=TTL_SECONDS, show_spinner=False)
+def validation_window(database: str) -> dict[str, Any] | None:
+    return repository.validation_window(engine(database))
 
 
 @st.cache_data(ttl=TTL_SECONDS, show_spinner=False)

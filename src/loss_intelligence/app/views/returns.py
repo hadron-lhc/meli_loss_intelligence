@@ -12,11 +12,14 @@ from loss_intelligence.app.components import (
     current_database,
     current_window,
     empty_state,
+    loading,
+    navigate_to,
     page_header,
 )
 from loss_intelligence.app.formatting import (
     condition_label,
     format_date,
+    format_datetime,
     format_days,
     format_int,
     format_pct,
@@ -91,7 +94,8 @@ def render() -> None:
     start_date, end_date = current_window()
 
     try:
-        summary = cache.returns_summary(database, start_date, end_date)
+        with loading("Loading returns intelligence..."):
+            summary = cache.returns_summary(database, start_date, end_date)
     except Exception as exc:  # pragma: no cover - surfaced in the UI
         st.error(f"Could not load returns intelligence: {exc}")
         return
@@ -219,6 +223,91 @@ def render() -> None:
             "These are review signals only. No customer is accused and no automatic action "
             "is taken."
         )
+
+    st.divider()
+    st.subheader("Return rate by product category")
+    by_category = pd.DataFrame(summary.get("by_category", []))
+    if by_category.empty:
+        st.caption("No category return records are available in this window.")
+    else:
+        by_category["return_rate_pct"] = by_category["return_rate"].apply(
+            lambda value: float(value) * 100 if pd.notna(value) else None
+        )
+        st.dataframe(
+            by_category[
+                [
+                    "category_name",
+                    "eligible_shipments",
+                    "shipments_with_return",
+                    "return_rate_pct",
+                    "return_count",
+                    "discrepancy_returns",
+                ]
+            ].rename(
+                columns={
+                    "category_name": "Product category",
+                    "eligible_shipments": "Eligible shipments",
+                    "shipments_with_return": "Returned shipments",
+                    "return_rate_pct": "Return rate",
+                    "return_count": "Returns",
+                    "discrepancy_returns": "Discrepancies",
+                }
+            ),
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "Eligible shipments": st.column_config.NumberColumn(format="%d"),
+                "Returned shipments": st.column_config.NumberColumn(format="%d"),
+                "Return rate": st.column_config.NumberColumn(format="%.2f%%"),
+                "Returns": st.column_config.NumberColumn(format="%d"),
+                "Discrepancies": st.column_config.NumberColumn(format="%d"),
+            },
+        )
+
+    st.divider()
+    st.subheader("Flagged shipments for review")
+    flagged = summary.get("flagged_shipments", [])
+    if not flagged:
+        st.caption("No repeat-return or discrepancy shipments found in this window.")
+    else:
+        fframe = pd.DataFrame(flagged)
+        fframe["latest_text"] = fframe["latest_initiated_at"].apply(format_datetime)
+        st.dataframe(
+            fframe[
+                [
+                    "shipment_code",
+                    "category_name",
+                    "return_count",
+                    "discrepancy_count",
+                    "latest_text",
+                ]
+            ].rename(
+                columns={
+                    "shipment_code": "Shipment",
+                    "category_name": "Category",
+                    "return_count": "Returns",
+                    "discrepancy_count": "Discrepancies",
+                    "latest_text": "Latest return",
+                }
+            ),
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "Returns": st.column_config.NumberColumn(format="%d"),
+                "Discrepancies": st.column_config.NumberColumn(format="%d"),
+            },
+        )
+        selected_shipment = st.selectbox(
+            "Inspect flagged shipment",
+            options=[row["shipment_id"] for row in flagged],
+            format_func=lambda value: next(
+                (row["shipment_code"] for row in flagged if row["shipment_id"] == value),
+                str(value),
+            ),
+            key="returns_flagged_shipment",
+        )
+        if st.button("Open in Shipment Explorer →", key="returns_open_shipment"):
+            navigate_to("shipments", nav_shipment_id=selected_shipment)
 
     conditions = pd.DataFrame(summary["by_condition"])
     if not conditions.empty:

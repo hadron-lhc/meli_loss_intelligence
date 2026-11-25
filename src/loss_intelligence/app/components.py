@@ -41,6 +41,23 @@ def show_flash() -> None:
         st.success(message)
 
 
+def loading(message: str = "Loading synthetic analytics..."):
+    return st.spinner(message)
+
+
+def register_pages(pages: dict[str, Any]) -> None:
+    st.session_state["_nav_pages"] = pages
+
+
+def navigate_to(page_key: str, **state_updates: Any) -> None:
+    for key, value in state_updates.items():
+        st.session_state[key] = value
+    pages = st.session_state.get("_nav_pages", {})
+    target = pages.get(page_key)
+    if target is not None:
+        st.switch_page(target)
+
+
 def chart_layout(fig: Any, *, height: int = 340) -> Any:
     fig.update_layout(
         template="plotly_white",
@@ -56,7 +73,7 @@ def current_database() -> str:
     return str(st.session_state.get("db_target", "main"))
 
 
-def _normalize_window(value: Any) -> tuple[date | None, date | None]:
+def normalize_date_range(value: Any) -> tuple[date | None, date | None]:
     if value is None:
         return None, None
     if isinstance(value, date):
@@ -72,7 +89,7 @@ def _normalize_window(value: Any) -> tuple[date | None, date | None]:
 
 def current_window() -> tuple[date | None, date | None]:
     database = current_database()
-    return _normalize_window(st.session_state.get(f"date_range_{database}"))
+    return normalize_date_range(st.session_state.get(f"date_range_{database}"))
 
 
 def current_minimum_volume() -> int:

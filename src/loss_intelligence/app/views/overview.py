@@ -16,6 +16,8 @@ from loss_intelligence.app.components import (
     current_window,
     empty_state,
     freshness_line,
+    loading,
+    navigate_to,
     page_header,
 )
 from loss_intelligence.app.formatting import (
@@ -71,15 +73,25 @@ def _render_kpis(overview: dict, counts: dict) -> None:
         help="Damage rate multiplied by 1,000.",
     )
     fifth.metric(
-        "Open alerts",
+        "Open alerts (current)",
         format_int(counts.get("open_alerts", 0)),
-        help="Alerts in new, acknowledged or investigating status.",
+        help=(
+            "Current global alerts in new, acknowledged or investigating status across all "
+            "detection runs (not filtered by the sidebar cohort window)."
+        ),
     )
     sixth.metric(
-        "Investigation backlog",
+        "Investigation backlog (current)",
         format_int(counts.get("investigation_backlog", 0)),
-        help="Investigations currently open or in review.",
+        help=(
+            "Current global investigations in open or in-review status (not filtered by the "
+            "sidebar cohort window)."
+        ),
     )
+
+    if counts.get("open_alerts", 0) > 0:
+        if st.button("Review open alerts →", key="overview_open_alerts_nav"):
+            navigate_to("alerts")
 
     if damage["low_volume"]:
         st.caption(
@@ -109,7 +121,45 @@ def _render_loss(losses: list[dict]) -> None:
     )
 
 
-def _render_trend(daily: list[dict]) -> None:
+def _add_maturity_marker(figure: go.Figure, frame: pd.DataFrame, maturity: dict) -> None:
+    mature_end = maturity.get("mature_end_date")
+    maturity_days = maturity.get("maturity_days", 0)
+    if mature_end is None or maturity_days <= 0 or frame.empty:
+        return
+    min_date = frame["cohort_date"].min().date()
+    max_date = frame["cohort_date"].max().date()
+    if mature_end >= max_date or mature_end < min_date:
+        return
+
+    boundary = mature_end.isoformat()
+    figure.add_vrect(
+        x0=boundary,
+        x1=max_date.isoformat(),
+        fillcolor="rgba(217, 119, 6, 0.10)",
+        line_width=0,
+    )
+    figure.add_shape(
+        type="line",
+        x0=boundary,
+        x1=boundary,
+        y0=0,
+        y1=1,
+        yref="paper",
+        line=dict(color="#d97706", width=1.5, dash="dash"),
+    )
+    figure.add_annotation(
+        x=boundary,
+        y=1,
+        yref="paper",
+        text=f"Immature tail ({maturity_days}d)",
+        showarrow=False,
+        xanchor="left",
+        yanchor="top",
+        font=dict(size=11, color="#b45309"),
+    )
+
+
+def _render_trend(daily: list[dict], maturity: dict) -> None:
     st.subheader("Damage-rate trend")
     frame = _daily_frame(daily)
     if frame.empty:
@@ -150,6 +200,7 @@ def _render_trend(daily: list[dict]) -> None:
         yaxis=dict(title="Damage rate", tickformat=".2%"),
         xaxis=dict(title="Shipment cohort date"),
     )
+    _add_maturity_marker(rate_figure, frame, maturity)
     chart_layout(rate_figure)
 
     volume_figure = go.Figure(
@@ -164,6 +215,7 @@ def _render_trend(daily: list[dict]) -> None:
         yaxis=dict(title="Eligible shipments"),
         xaxis=dict(title="Shipment cohort date"),
     )
+    _add_maturity_marker(volume_figure, frame, maturity)
     chart_layout(volume_figure)
 
     left, right = st.columns(2)
@@ -254,19 +306,20 @@ def render() -> None:
     maturity_days = current_maturity_days()
 
     try:
-        overview = cache.overview(
-            database,
-            start_date,
-            end_date,
-            minimum_volume,
-            confidence,
-            maturity_days,
-        )
-        daily = cache.daily_metrics(database, start_date, end_date, minimum_volume, confidence)
-        losses = cache.loss_by_currency(database, start_date, end_date)
-        quality = cache.data_quality(database, start_date, end_date)
-        counts = cache.operational_counts(database)
-        freshness = cache.data_freshness(database)
+        with loading("Loading operations overview..."):
+            overview = cache.overview(
+                database,
+                start_date,
+                end_date,
+                minimum_volume,
+                confidence,
+                maturity_days,
+            )
+            daily = cache.daily_metrics(database, start_date, end_date, minimum_volume, confidence)
+            losses = cache.loss_by_currency(database, start_date, end_date)
+            quality = cache.data_quality(database, start_date, end_date)
+            counts = cache.operational_counts(database)
+            freshness = cache.data_freshness(database)
     except Exception as exc:  # pragma: no cover - surfaced in the UI
         st.error(f"Could not load the operations overview: {exc}")
         return
@@ -286,7 +339,7 @@ def render() -> None:
     st.divider()
     _render_loss(losses)
     st.divider()
-    _render_trend(daily)
+    _render_trend(daily, overview["maturity"])
     st.divider()
     _render_maturity(overview)
     _render_data_quality(quality)

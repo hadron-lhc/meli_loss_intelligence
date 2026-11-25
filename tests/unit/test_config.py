@@ -11,6 +11,11 @@ def test_defaults_use_local_port_5433() -> None:
     assert ":5433/" in settings.test_admin_database_url
 
 
+def test_production_environment_is_supported() -> None:
+    settings = Settings(_env_file=None, app_env="production")
+    assert settings.app_env == "production"
+
+
 def test_invalid_log_level_is_rejected() -> None:
     with pytest.raises(ValidationError):
         Settings(_env_file=None, log_level="LOUD")

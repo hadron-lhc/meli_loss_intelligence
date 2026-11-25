@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import pandas as pd
 import streamlit as st
+from sqlalchemy.exc import SQLAlchemyError
 
 from loss_intelligence.app import cache, repository
 from loss_intelligence.app.components import (
     current_database,
     empty_state,
+    loading,
+    navigate_to,
     page_header,
     set_flash,
     show_flash,
@@ -50,14 +53,16 @@ def _render_create_section(database: str) -> None:
     )
     if st.button("Create investigation", type="primary"):
         try:
-            investigation_id = repository.create_investigation(
-                cache.engine(database),
-                selected,
-            )
-        except ValueError as exc:
-            st.error(str(exc))
+            with loading("Creating investigation..."):
+                investigation_id = repository.create_investigation(
+                    cache.engine(database),
+                    selected,
+                )
+        except (ValueError, SQLAlchemyError) as exc:
+            st.error(f"Could not create investigation: {exc}")
         else:
             cache.clear_data_cache()
+            st.session_state[f"investigation_selected_{database}"] = investigation_id
             set_flash(f"Investigation {investigation_id} created.")
             st.rerun()
 
@@ -95,6 +100,11 @@ def _render_detail(database: str, investigation_id) -> None:
             f"{detail.get('observed_numerator') or 0:,} / "
             f"{detail.get('observed_denominator') or 0:,}",
         )
+        if st.button(
+            "Open source alert in Alerts & Anomalies →",
+            key=f"inv_open_alert_{investigation_id}",
+        ):
+            navigate_to("alerts", nav_alert_id=detail["alert_id"])
     else:
         st.caption(f"Incident-linked investigation `{detail.get('incident_id')}`.")
 
@@ -141,17 +151,18 @@ def _render_detail(database: str, investigation_id) -> None:
 
     if submitted:
         try:
-            repository.update_investigation(
-                cache.engine(database),
-                investigation_id,
-                status=status,
-                outcome=outcome,
-                notes=notes or None,
-                recommended_action=recommended_action or None,
-                reviewer_label=repository.DEMO_REVIEWER,
-            )
-        except ValueError as exc:
-            st.error(str(exc))
+            with loading("Saving investigation..."):
+                repository.update_investigation(
+                    cache.engine(database),
+                    investigation_id,
+                    status=status,
+                    outcome=outcome,
+                    notes=notes or None,
+                    recommended_action=recommended_action or None,
+                    reviewer_label=repository.DEMO_REVIEWER,
+                )
+        except (ValueError, SQLAlchemyError) as exc:
+            st.error(f"Could not save investigation: {exc}")
         else:
             cache.clear_data_cache()
             set_flash("Investigation updated and audit trail recorded.")
@@ -208,6 +219,13 @@ def render() -> None:
     )
     show_flash()
     database = current_database()
+    select_key = f"investigation_selected_{database}"
+
+    nav_investigation_id = st.session_state.pop("nav_investigation_id", None)
+    if nav_investigation_id is not None:
+        st.session_state[select_key] = nav_investigation_id
+        st.session_state.pop("investigation_status_filter", None)
+        st.session_state.pop("investigation_outcome_filter", None)
 
     _render_create_section(database)
     st.divider()
@@ -229,11 +247,12 @@ def render() -> None:
         )
 
     try:
-        investigations = cache.list_investigations(
-            database,
-            tuple(statuses) or None,
-            tuple(outcomes) or None,
-        )
+        with loading("Loading investigations..."):
+            investigations = cache.list_investigations(
+                database,
+                tuple(statuses) or None,
+                tuple(outcomes) or None,
+            )
     except Exception as exc:  # pragma: no cover - surfaced in the UI
         st.error(f"Could not load investigations: {exc}")
         return
@@ -288,9 +307,13 @@ def render() -> None:
         width="stretch",
     )
 
+    inv_options = [row["investigation_id"] for row in investigations]
+    if select_key in st.session_state and st.session_state[select_key] not in inv_options:
+        st.session_state[select_key] = inv_options[0]
+
     selected = st.selectbox(
         "Open investigation",
-        options=[row["investigation_id"] for row in investigations],
+        options=inv_options,
         format_func=lambda value: next(
             (
                 f"{row['investigation_short']} · {row['status_text']} · "
@@ -300,6 +323,7 @@ def render() -> None:
             ),
             str(value),
         ),
+        key=select_key,
     )
     st.divider()
     _render_detail(database, selected)

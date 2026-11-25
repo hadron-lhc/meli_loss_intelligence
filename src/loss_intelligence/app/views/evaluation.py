@@ -11,6 +11,7 @@ from loss_intelligence.app import cache
 from loss_intelligence.app.components import (
     current_database,
     empty_state,
+    loading,
     page_header,
 )
 from loss_intelligence.app.formatting import (
@@ -146,7 +147,9 @@ def render() -> None:
     database = current_database()
 
     try:
-        runs = cache.detection_runs(database)
+        with loading("Loading detection runs..."):
+            runs = cache.detection_runs(database)
+            val_window = cache.validation_window(database)
     except Exception as exc:  # pragma: no cover - surfaced in the UI
         st.error(f"Could not load detection runs: {exc}")
         return
@@ -204,13 +207,28 @@ def render() -> None:
     k = st.number_input("K for precision@K", min_value=1, max_value=100, value=10, step=1)
 
     try:
-        summary = cache.evaluation_summary(database, selected_run, int(k))
+        with loading("Evaluating detection run..."):
+            summary = cache.evaluation_summary(database, selected_run, int(k))
     except ValueError as exc:
         empty_state(f"Evaluation is not available for this run: {exc}")
         return
     except Exception as exc:  # pragma: no cover - surfaced in the UI
         st.error(f"Could not evaluate this run: {exc}")
         return
+
+    selected = next(row for row in runs if row["detection_run_id"] == selected_run)
+    if val_window is not None and selected.get("min_observed_start") is not None:
+        outside_validation = (
+            selected["max_observed_end"] <= val_window["start_at"]
+            or selected["min_observed_start"] >= val_window["end_at"]
+        )
+        if outside_validation:
+            st.info(
+                "This detection run's observed alerts do not overlap the validation-scenario "
+                f"window ({format_datetime(val_window['start_at'])} → "
+                f"{format_datetime(val_window['end_at'])}). Select a `make detect-validation` "
+                "run for held-out validation metrics."
+            )
 
     st.caption(
         f"Run {selected_run} · split {summary['split']} · "
@@ -223,7 +241,6 @@ def render() -> None:
     st.divider()
     _render_model_comparison(summary)
 
-    selected = next(row for row in runs if row["detection_run_id"] == selected_run)
     with st.expander("Detection run configuration"):
         st.code(json.dumps(selected["config"], indent=2, default=str), language="json")
         st.caption(f"Config hash: `{selected['config_hash']}`")

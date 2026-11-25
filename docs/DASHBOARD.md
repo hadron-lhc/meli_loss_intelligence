@@ -26,13 +26,13 @@ shared across the operations pages.
 
 | Page | Purpose |
 |---|---|
-| Operations Overview | Processed shipments, confirmed incidents, damage rate, damages per 1,000, estimated loss by currency, open alerts, backlog, trend and data quality. |
-| Damage Hotspots | Facility, carrier, carrier-zone, zone, category, packaging and stage rates with denominators, Wilson intervals, incident share, low-volume flags and optional previous-period comparison. |
-| Alerts & Anomalies | Filters by status, priority, type and generated date; observed/baseline rates, explanation, evidence and shipment drill-down. |
-| Shipment Explorer | Search by shipment code or ID, inspect characteristics, chronological events, incidents and associated alerts. |
-| Investigation Workspace | Create an investigation from an alert, record status, outcome, notes and recommended action, and review the append-only audit trail. |
-| Returns Intelligence | Return volume, declared reasons, inspection outcomes, repeat-return and discrepancy signals. Review signals only; not a fraud determination. |
-| Model & Evaluation | Detection runs, held-out validation metrics and the documented absence of an Isolation Forest comparison. |
+| Operations Overview | Processed shipments, confirmed incidents, damage rate, damages per 1,000, estimated loss by currency, current open alerts and backlog, daily trend with maturity-horizon marker, and data quality. |
+| Damage Hotspots | Facility, carrier, carrier-zone, zone, category, packaging and stage rates with denominators, Wilson intervals, incident share, low-volume flags, optional previous-period comparison, and group drill-down to shipments and alerts. |
+| Alerts & Anomalies | Filters by status, priority, type and generated date; observed/baseline rates, explanation, evidence (`shipment`, `incident`, `return`, `event`), alert triage (`acknowledge`, `dismiss`), and drill-down to Shipment Explorer or Investigation Workspace. |
+| Shipment Explorer | Search by shipment code or ID with status and confirmed-damage filters, inspect characteristics, chronological events, incidents (with `related_event`), returns and associated alerts. |
+| Investigation Workspace | Create an investigation from an alert, record status, outcome, notes and recommended action, jump to the source alert, and review the append-only audit trail. |
+| Returns Intelligence | Return volume, declared reasons, inspection outcomes, category return rates, repeat-return and discrepancy review signals, and shipment drill-down. Review signals only; not a fraud determination. |
+| Model & Evaluation | Detection runs, held-out validation metrics (with notice for non-validation run windows) and the documented absence of an Isolation Forest comparison. |
 
 ## Architecture
 

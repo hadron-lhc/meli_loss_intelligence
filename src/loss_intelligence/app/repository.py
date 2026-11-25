@@ -17,6 +17,8 @@ from sqlalchemy import Engine, text
 from sqlalchemy.exc import IntegrityError
 
 from loss_intelligence.analytics.metrics import (
+    SCOPE_TYPES,
+    build_rate_stats,
     get_daily_metrics,
     get_data_quality,
     get_loss_by_currency,
@@ -28,6 +30,7 @@ from loss_intelligence.detection.evaluation import evaluate_validation
 
 DEMO_REVIEWER = "demo_reviewer (synthetic)"
 
+HOTSPOT_SCOPE_TYPES: tuple[str, ...] = (*SCOPE_TYPES, "carrier_zone")
 INVESTIGATION_STATUSES = ("open", "in_review", "closed", "dismissed")
 INVESTIGATION_OUTCOMES = (
     "confirmed_issue",
@@ -156,6 +159,114 @@ def daily_metrics(
     ]
 
 
+def _carrier_zone_hotspots(
+    engine: Engine,
+    start_date: date | None,
+    end_date: date | None,
+    *,
+    minimum_volume: int,
+    confidence: float,
+    limit: int | None,
+) -> list[dict[str, Any]]:
+    if start_date is not None and end_date is not None and start_date > end_date:
+        raise ValueError("start_date must be on or before end_date")
+    if limit is not None and limit < 1:
+        raise ValueError("limit must be at least one")
+
+    conditions: list[str] = []
+    parameters: dict[str, Any] = {"minimum_volume": minimum_volume}
+    if start_date is not None:
+        conditions.append("cohort_date >= :start_date")
+        parameters["start_date"] = start_date
+    if end_date is not None:
+        conditions.append("cohort_date <= :end_date")
+        parameters["end_date"] = end_date
+    where_clause = " WHERE " + " AND ".join(conditions) if conditions else ""
+    and_clause = " AND " + " AND ".join(conditions) if conditions else ""
+    limit_clause = " LIMIT :limit" if limit is not None else ""
+    if limit is not None:
+        parameters["limit"] = limit
+
+    sql = f"""
+        WITH exposure AS (
+            SELECT
+                es.carrier_id::text || ':' || es.destination_zone_id::text AS scope_id,
+                c.carrier_name || ' / ' || z.zone_name AS scope_name,
+                count(*)::bigint AS denominator
+            FROM analytics.eligible_shipments es
+            JOIN carriers c ON c.carrier_id = es.carrier_id
+            JOIN zones z ON z.zone_id = es.destination_zone_id
+            WHERE es.carrier_id IS NOT NULL
+              AND es.destination_zone_id IS NOT NULL
+              {and_clause}
+            GROUP BY es.carrier_id, es.destination_zone_id, c.carrier_name, z.zone_name
+        ),
+        damage AS (
+            SELECT
+                cdi.shipment_carrier_id::text || ':' || cdi.destination_zone_id::text AS scope_id,
+                count(DISTINCT cdi.shipment_id)::bigint AS numerator,
+                count(*)::bigint AS incident_count
+            FROM analytics.confirmed_damage_incidents cdi
+            WHERE cdi.shipment_carrier_id IS NOT NULL
+              AND cdi.destination_zone_id IS NOT NULL
+              {and_clause}
+            GROUP BY cdi.shipment_carrier_id, cdi.destination_zone_id
+        ),
+        combined AS (
+            SELECT
+                COALESCE(x.scope_id, d.scope_id) AS scope_id,
+                x.scope_name,
+                COALESCE(x.denominator, 0)::bigint AS denominator,
+                COALESCE(d.numerator, 0)::bigint AS numerator,
+                COALESCE(d.incident_count, 0)::bigint AS incident_count
+            FROM exposure x
+            LEFT JOIN damage d ON d.scope_id = x.scope_id
+        )
+        SELECT scope_id, scope_name, denominator, numerator, incident_count
+        FROM combined
+        ORDER BY
+            CASE WHEN denominator >= :minimum_volume THEN 0 ELSE 1 END,
+            CASE
+                WHEN denominator > 0 THEN numerator::numeric / denominator
+                ELSE NULL
+            END DESC NULLS LAST,
+            denominator DESC,
+            scope_id
+        {limit_clause}
+    """
+    with engine.connect() as connection:
+        total_incidents = connection.execute(
+            text(
+                "SELECT count(*)::bigint FROM analytics.confirmed_damage_incidents" + where_clause
+            ),
+            parameters,
+        ).scalar_one()
+        rows = connection.execute(text(sql), parameters).all()
+
+    results: list[dict[str, Any]] = []
+    for row in rows:
+        incident_share = row.incident_count / total_incidents if total_incidents > 0 else None
+        stats = build_rate_stats(
+            row.numerator,
+            row.denominator,
+            minimum_volume=minimum_volume,
+            confidence=confidence,
+        )
+        results.append(
+            {
+                "scope_type": "carrier_zone",
+                "scope_id": row.scope_id,
+                "scope_name": row.scope_name,
+                "eligible_shipments": row.denominator,
+                "confirmed_damage_shipments": row.numerator,
+                "confirmed_damage_incidents": row.incident_count,
+                "incident_share": incident_share,
+                "damage": asdict(stats),
+            }
+        )
+    return results
+
+
 def hotspots(
     engine: Engine,
     scope_type: str,
@@ -166,6 +277,15 @@ def hotspots(
     confidence: float = 0.95,
     limit: int | None = None,
 ) -> list[dict[str, Any]]:
+    if scope_type == "carrier_zone":
+        return _carrier_zone_hotspots(
+            engine,
+            start_date,
+            end_date,
+            minimum_volume=minimum_volume,
+            confidence=confidence,
+            limit=limit,
+        )
     return [
         asdict(item)
         for item in get_scope_hotspots(
@@ -178,6 +298,129 @@ def hotspots(
             limit=limit,
         )
     ]
+
+
+def hotspot_drilldown(
+    engine: Engine,
+    scope_type: str,
+    scope_id: str,
+    start_date: date | None,
+    end_date: date | None,
+    *,
+    limit: int = 25,
+) -> dict[str, Any]:
+    if scope_type not in HOTSPOT_SCOPE_TYPES:
+        raise ValueError(f"unsupported scope_type: {scope_type}")
+
+    scope_conditions = {
+        "facility": "cdi.related_facility_id::text = :scope_id",
+        "carrier": "cdi.shipment_carrier_id::text = :scope_id",
+        "carrier_zone": (
+            "cdi.shipment_carrier_id::text = split_part(:scope_id, ':', 1) "
+            "AND cdi.destination_zone_id::text = split_part(:scope_id, ':', 2)"
+        ),
+        "zone": "cdi.destination_zone_id::text = :scope_id",
+        "product_category": "cdi.product_category_id::text = :scope_id",
+        "packaging_type": "cdi.packaging_type_id::text = :scope_id",
+        "stage": "cdi.related_stage::text = :scope_id",
+    }
+    parameters: dict[str, Any] = {"scope_type": scope_type, "scope_id": scope_id, "limit": limit}
+    date_filters = []
+    if start_date is not None:
+        date_filters.append("cdi.cohort_date >= :start_date")
+        parameters["start_date"] = start_date
+    if end_date is not None:
+        date_filters.append("cdi.cohort_date <= :end_date")
+        parameters["end_date"] = end_date
+    date_clause = (" AND " + " AND ".join(date_filters)) if date_filters else ""
+
+    shipments_sql = f"""
+        WITH scoped AS (
+            SELECT
+                cdi.shipment_id,
+                cdi.confirmed_at,
+                cdi.estimated_loss_amount,
+                cdi.currency_code
+            FROM analytics.confirmed_damage_incidents cdi
+            WHERE {scope_conditions[scope_type]}
+            {date_clause}
+        ),
+        shipment_incidents AS (
+            SELECT
+                shipment_id,
+                count(*)::bigint AS incident_count,
+                max(confirmed_at) AS latest_confirmed_at
+            FROM scoped
+            GROUP BY shipment_id
+        ),
+        currency_losses AS (
+            SELECT
+                shipment_id,
+                currency_code,
+                sum(estimated_loss_amount) AS estimated_loss_amount
+            FROM scoped
+            WHERE estimated_loss_amount IS NOT NULL
+              AND currency_code IS NOT NULL
+            GROUP BY shipment_id, currency_code
+        ),
+        shipment_losses AS (
+            SELECT
+                shipment_id,
+                jsonb_agg(
+                    jsonb_build_object(
+                        'currency_code', currency_code,
+                        'estimated_loss_amount', estimated_loss_amount
+                    )
+                    ORDER BY currency_code
+                ) AS loss_by_currency
+            FROM currency_losses
+            GROUP BY shipment_id
+        )
+        SELECT
+            s.shipment_id,
+            s.shipment_code,
+            s.shipment_status,
+            s.created_at,
+            c.carrier_name,
+            z.zone_name AS destination_zone,
+            pc.category_name AS product_category,
+            si.incident_count,
+            si.latest_confirmed_at,
+            COALESCE(sl.loss_by_currency, '[]'::jsonb) AS loss_by_currency
+        FROM shipment_incidents si
+        JOIN shipments s ON s.shipment_id = si.shipment_id
+        LEFT JOIN carriers c ON c.carrier_id = s.carrier_id
+        LEFT JOIN zones z ON z.zone_id = s.destination_zone_id
+        LEFT JOIN product_categories pc ON pc.product_category_id = s.product_category_id
+        LEFT JOIN shipment_losses sl ON sl.shipment_id = si.shipment_id
+        ORDER BY si.latest_confirmed_at DESC NULLS LAST, s.created_at DESC, s.shipment_code
+        LIMIT :limit
+    """
+    alerts_sql = f"""
+        WITH alert_scope AS (
+            SELECT a.*, {SCOPE_NAME_EXPR} AS scope_name
+            FROM anomaly_alerts a
+        )
+        SELECT
+            a.alert_id,
+            a.alert_type,
+            a.scope_type,
+            a.scope_name,
+            a.priority,
+            a.status,
+            a.observed_rate,
+            a.baseline_rate,
+            a.generated_at
+        FROM alert_scope a
+        WHERE a.scope_type = :scope_type
+          AND a.scope_id = :scope_id
+        ORDER BY a.generated_at DESC, a.alert_id
+        LIMIT :limit
+    """
+    with engine.connect() as connection:
+        shipments = _rows(connection.execute(text(shipments_sql), parameters))
+        alerts = _rows(connection.execute(text(alerts_sql), parameters))
+    return {"shipments": shipments, "alerts": alerts}
 
 
 def loss_by_currency(
@@ -386,8 +629,10 @@ def alert_evidence(engine: Engine, alert_id: UUID) -> list[dict[str, Any]]:
             ev.evidence_role,
             ev.contribution,
             ev.created_at,
-            COALESCE(s.shipment_id, si.shipment_id) AS shipment_id,
-            COALESCE(s.shipment_code, si.shipment_code) AS shipment_code,
+            COALESCE(s.shipment_id, si.shipment_id, sr.shipment_id, se.shipment_id)
+                AS shipment_id,
+            COALESCE(s.shipment_code, si.shipment_code, sr.shipment_code, se.shipment_code)
+                AS shipment_code,
             s.shipment_status,
             s.created_at AS shipment_created_at,
             s.delivered_at AS shipment_delivered_at,
@@ -398,18 +643,74 @@ def alert_evidence(engine: Engine, alert_id: UUID) -> list[dict[str, Any]]:
             i.reported_at,
             i.confirmed_at,
             i.estimated_loss_amount,
-            i.currency_code
+            i.currency_code,
+            r.return_id,
+            r.declared_reason AS return_declared_reason,
+            r.inspection_outcome AS return_inspection_outcome,
+            r.condition_on_return AS return_condition,
+            evt.event_id,
+            evt.event_code,
+            evt.stage AS event_stage
         FROM anomaly_alert_evidence ev
         LEFT JOIN shipments s
             ON ev.entity_type = 'shipment' AND s.shipment_id = ev.entity_id
         LEFT JOIN incidents i
             ON ev.entity_type = 'incident' AND i.incident_id = ev.entity_id
         LEFT JOIN shipments si ON si.shipment_id = i.shipment_id
+        LEFT JOIN returns r
+            ON ev.entity_type = 'return' AND r.return_id = ev.entity_id
+        LEFT JOIN shipments sr ON sr.shipment_id = r.shipment_id
+        LEFT JOIN shipment_events evt
+            ON ev.entity_type = 'event' AND evt.event_id = ev.entity_id
+        LEFT JOIN shipments se ON se.shipment_id = evt.shipment_id
         WHERE ev.alert_id = :alert_id
         ORDER BY ev.evidence_role, ev.entity_type, ev.created_at
     """
     with engine.connect() as connection:
         return _rows(connection.execute(text(sql), {"alert_id": alert_id}))
+
+
+def update_alert_status(
+    engine: Engine,
+    alert_id: UUID,
+    *,
+    status: str,
+) -> None:
+    allowed = {"acknowledged", "dismissed"}
+    if status not in allowed:
+        raise ValueError(f"unsupported alert triage status: {status}")
+
+    with engine.begin() as connection:
+        active_investigation = connection.execute(
+            text(
+                """
+                SELECT 1
+                FROM investigations
+                WHERE alert_id = :alert_id
+                  AND status IN ('open', 'in_review')
+                LIMIT 1
+                """
+            ),
+            {"alert_id": alert_id},
+        ).scalar_one_or_none()
+        if status == "dismissed" and active_investigation is not None:
+            raise ValueError(
+                "cannot dismiss an alert directly while an active investigation is open"
+            )
+
+        updated = connection.execute(
+            text(
+                """
+                UPDATE anomaly_alerts
+                SET status = :status
+                WHERE alert_id = :alert_id
+                RETURNING alert_id
+                """
+            ),
+            {"alert_id": alert_id, "status": status},
+        ).one_or_none()
+        if updated is None:
+            raise ValueError("alert not found")
 
 
 def alerts_without_active_investigation(
@@ -457,6 +758,8 @@ def shipment_search(
     engine: Engine,
     query: str | None = None,
     *,
+    status: str | None = None,
+    damaged_only: bool = False,
     limit: int = 25,
 ) -> list[dict[str, Any]]:
     conditions: list[str] = []
@@ -464,6 +767,21 @@ def shipment_search(
     if query and query.strip():
         conditions.append("(s.shipment_code ILIKE :pattern OR s.shipment_id::text ILIKE :pattern)")
         parameters["pattern"] = f"%{query.strip()}%"
+    if status:
+        conditions.append("s.shipment_status = :status")
+        parameters["status"] = status
+    if damaged_only:
+        conditions.append(
+            """
+            EXISTS (
+                SELECT 1
+                FROM incidents i
+                WHERE i.shipment_id = s.shipment_id
+                  AND i.incident_type = 'package_damage'
+                  AND i.incident_status = 'confirmed'
+            )
+            """
+        )
     where_clause = " WHERE " + " AND ".join(conditions) if conditions else ""
     sql = f"""
         SELECT
@@ -561,10 +879,32 @@ def shipment_incidents(engine: Engine, shipment_id: UUID) -> list[dict[str, Any]
             i.currency_code,
             i.evidence_type,
             i.notes,
-            i.related_event_id
+            i.related_event_id,
+            e.sequence_number AS related_event_sequence,
+            e.event_code AS related_event_code,
+            e.stage AS related_event_stage
         FROM incidents i
+        LEFT JOIN shipment_events e ON e.event_id = i.related_event_id
         WHERE i.shipment_id = :shipment_id
         ORDER BY i.reported_at, i.incident_id
+    """
+    with engine.connect() as connection:
+        return _rows(connection.execute(text(sql), {"shipment_id": shipment_id}))
+
+
+def shipment_returns(engine: Engine, shipment_id: UUID) -> list[dict[str, Any]]:
+    sql = """
+        SELECT
+            return_id,
+            initiated_at,
+            received_at,
+            declared_reason,
+            inspection_outcome,
+            return_status,
+            condition_on_return
+        FROM returns
+        WHERE shipment_id = :shipment_id
+        ORDER BY initiated_at, return_id
     """
     with engine.connect() as connection:
         return _rows(connection.execute(text(sql), {"shipment_id": shipment_id}))
@@ -801,52 +1141,55 @@ def update_investigation(
     if not closing:
         outcome = None
 
-    with engine.begin() as connection:
-        row = connection.execute(
-            text(
-                """
-                UPDATE investigations
-                SET
-                    status = :status,
-                    outcome = :outcome,
-                    notes = :notes,
-                    recommended_action = :recommended_action,
-                    reviewer_label = :reviewer_label,
-                    closed_at = CASE WHEN :closing THEN NOW() ELSE NULL END
-                WHERE investigation_id = :investigation_id
-                RETURNING alert_id
-                """
-            ),
-            {
-                "status": status,
-                "outcome": outcome,
-                "notes": notes,
-                "recommended_action": recommended_action,
-                "reviewer_label": reviewer_label,
-                "closing": closing,
-                "investigation_id": investigation_id,
-            },
-        ).one_or_none()
-        if row is None:
-            raise ValueError("investigation not found")
-
-        if row.alert_id is not None:
-            if status == "dismissed":
-                alert_status = "dismissed"
-            elif status == "closed":
-                alert_status = "resolved"
-            else:
-                alert_status = "investigating"
-            connection.execute(
+    try:
+        with engine.begin() as connection:
+            row = connection.execute(
                 text(
                     """
-                    UPDATE anomaly_alerts
-                    SET status = :alert_status
-                    WHERE alert_id = :alert_id
+                    UPDATE investigations
+                    SET
+                        status = :status,
+                        outcome = :outcome,
+                        notes = :notes,
+                        recommended_action = :recommended_action,
+                        reviewer_label = :reviewer_label,
+                        closed_at = CASE WHEN :closing THEN NOW() ELSE NULL END
+                    WHERE investigation_id = :investigation_id
+                    RETURNING alert_id
                     """
                 ),
-                {"alert_status": alert_status, "alert_id": row.alert_id},
-            )
+                {
+                    "status": status,
+                    "outcome": outcome,
+                    "notes": notes,
+                    "recommended_action": recommended_action,
+                    "reviewer_label": reviewer_label,
+                    "closing": closing,
+                    "investigation_id": investigation_id,
+                },
+            ).one_or_none()
+            if row is None:
+                raise ValueError("investigation not found")
+
+            if row.alert_id is not None:
+                if status == "dismissed":
+                    alert_status = "dismissed"
+                elif status == "closed":
+                    alert_status = "resolved"
+                else:
+                    alert_status = "investigating"
+                connection.execute(
+                    text(
+                        """
+                        UPDATE anomaly_alerts
+                        SET status = :alert_status
+                        WHERE alert_id = :alert_id
+                        """
+                    ),
+                    {"alert_status": alert_status, "alert_id": row.alert_id},
+                )
+    except IntegrityError as exc:
+        raise ValueError("an active investigation already exists for this alert") from exc
 
 
 def returns_summary(
@@ -861,13 +1204,13 @@ def returns_summary(
     parameters = {"start_date": start_date, "end_date": end_date}
     eligible_cte = f"""
         eligible AS (
-            SELECT es.shipment_id
+            SELECT es.shipment_id, es.product_category_id
             FROM analytics.eligible_shipments es
             WHERE TRUE
             {filters}
         ),
         returns_window AS (
-            SELECT r.*
+            SELECT r.*, e.product_category_id
             FROM returns r
             JOIN eligible e ON e.shipment_id = r.shipment_id
         )
@@ -953,6 +1296,70 @@ def returns_summary(
         GROUP BY declared_reason
         ORDER BY return_count DESC, declared_reason
     """
+    category_sql = f"""
+        WITH {eligible_cte},
+        eligible_by_cat AS (
+            SELECT product_category_id, count(*)::bigint AS eligible_shipments
+            FROM eligible
+            GROUP BY product_category_id
+        ),
+        returns_by_cat AS (
+            SELECT
+                product_category_id,
+                count(*)::bigint AS return_count,
+                count(DISTINCT shipment_id)::bigint AS shipments_with_return,
+                count(*) FILTER (
+                    WHERE inspection_outcome = 'does_not_match_declaration'
+                )::bigint AS discrepancy_returns
+            FROM returns_window
+            GROUP BY product_category_id
+        )
+        SELECT
+            pc.category_name,
+            ec.eligible_shipments,
+            COALESCE(rc.shipments_with_return, 0)::bigint AS shipments_with_return,
+            COALESCE(rc.return_count, 0)::bigint AS return_count,
+            COALESCE(rc.discrepancy_returns, 0)::bigint AS discrepancy_returns,
+            CASE
+                WHEN ec.eligible_shipments > 0
+                THEN COALESCE(rc.shipments_with_return, 0)::double precision / ec.eligible_shipments
+                ELSE NULL
+            END AS return_rate
+        FROM eligible_by_cat ec
+        JOIN product_categories pc ON pc.product_category_id = ec.product_category_id
+        LEFT JOIN returns_by_cat rc ON rc.product_category_id = ec.product_category_id
+        ORDER BY return_rate DESC NULLS LAST, return_count DESC, pc.category_name
+    """
+    flagged_sql = f"""
+        WITH {eligible_cte},
+        per_shipment AS (
+            SELECT
+                rw.shipment_id,
+                count(*)::bigint AS return_count,
+                count(*) FILTER (
+                    WHERE rw.inspection_outcome = 'does_not_match_declaration'
+                )::bigint AS discrepancy_count,
+                max(rw.initiated_at) AS latest_initiated_at
+            FROM returns_window rw
+            GROUP BY rw.shipment_id
+            HAVING count(*) > 1
+                OR count(*) FILTER (
+                    WHERE rw.inspection_outcome = 'does_not_match_declaration'
+                ) > 0
+        )
+        SELECT
+            ps.shipment_id,
+            s.shipment_code,
+            pc.category_name,
+            ps.return_count,
+            ps.discrepancy_count,
+            ps.latest_initiated_at
+        FROM per_shipment ps
+        JOIN shipments s ON s.shipment_id = ps.shipment_id
+        LEFT JOIN product_categories pc ON pc.product_category_id = s.product_category_id
+        ORDER BY ps.discrepancy_count DESC, ps.return_count DESC, ps.latest_initiated_at DESC
+        LIMIT 25
+    """
 
     with engine.connect() as connection:
         totals = dict(connection.execute(text(totals_sql), parameters).one()._mapping)
@@ -961,6 +1368,8 @@ def returns_summary(
         conditions = _rows(connection.execute(text(condition_sql), parameters))
         daily = _rows(connection.execute(text(daily_sql), parameters))
         discrepancies = _rows(connection.execute(text(discrepancy_sql), parameters))
+        by_category = _rows(connection.execute(text(category_sql), parameters))
+        flagged_shipments = _rows(connection.execute(text(flagged_sql), parameters))
 
     return {
         "totals": totals,
@@ -969,7 +1378,25 @@ def returns_summary(
         "by_condition": conditions,
         "daily": daily,
         "discrepancy_by_reason": discrepancies,
+        "by_category": by_category,
+        "flagged_shipments": flagged_shipments,
     }
+
+
+def validation_window(engine: Engine) -> dict[str, Any] | None:
+    sql = """
+        SELECT
+            min(start_at) AS start_at,
+            max(end_at) AS end_at
+        FROM evaluation.synthetic_scenarios
+        WHERE split = 'validation'
+          AND expected_detection = TRUE
+    """
+    with engine.connect() as connection:
+        row = connection.execute(text(sql)).one()
+    if row.start_at is None or row.end_at is None:
+        return None
+    return {"start_at": row.start_at, "end_at": row.end_at}
 
 
 def detection_runs(engine: Engine, *, limit: int = 50) -> list[dict[str, Any]]:
@@ -983,7 +1410,9 @@ def detection_runs(engine: Engine, *, limit: int = 50) -> list[dict[str, Any]]:
             dr.status,
             dr.started_at,
             dr.completed_at,
-            count(a.alert_id)::bigint AS alert_count
+            count(a.alert_id)::bigint AS alert_count,
+            min(a.observed_start) AS min_observed_start,
+            max(a.observed_end) AS max_observed_end
         FROM meta.detection_runs dr
         LEFT JOIN anomaly_alerts a ON a.detection_run_id = dr.detection_run_id
         GROUP BY

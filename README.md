@@ -207,7 +207,8 @@ Defaults and matching rules are in [docs/DETECTION.md](docs/DETECTION.md).
 
 Run `make dashboard` and open `http://localhost:8501`. See
 [docs/DASHBOARD.md](docs/DASHBOARD.md) for page details, architecture and
-limitations.
+limitations. For the low-Cloudflare-usage demo deployment, see
+[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
 ## Database design
 
@@ -257,9 +258,16 @@ src/loss_intelligence/
 │   ├── scenarios.py   # split-aware scenario injection
 │   ├── writer.py      # JSONL/manifest writer and dataset resolution
 │   └── cli.py         # generation command
-└── ingestion/
-    ├── validation.py  # dataset integrity, truth and leakage checks
-    └── loader.py      # transactional COPY loader and generation-run record
+├── ingestion/
+│   ├── validation.py  # dataset integrity, truth and leakage checks
+│   └── loader.py      # transactional COPY loader and generation-run record
+└── app/
+    ├── streamlit_app.py # Streamlit entrypoint and page navigation
+    ├── components.py    # persistent disclaimer, sidebar controls and navigation helpers
+    ├── cache.py         # 60s TTL cache wrappers and invalidation
+    ├── formatting.py    # shared display formatters and labels
+    ├── repository.py    # SQL read queries and transactional investigation/alert writes
+    └── views/           # overview, hotspots, alerts, shipments, investigations, returns, evaluation
 sql/
 ├── 001_schema.sql
 ├── 002_schema_amendments.sql

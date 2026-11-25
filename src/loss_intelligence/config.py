@@ -24,7 +24,7 @@ class Settings(BaseSettings):
         case_sensitive=False,
     )
 
-    app_env: Literal["local", "test", "ci"] = "local"
+    app_env: Literal["local", "test", "ci", "production"] = "local"
     log_level: str = "INFO"
     db_echo: bool = False
     database_url: str = DEFAULT_DATABASE_URL

@@ -13,17 +13,33 @@ from loss_intelligence.app.components import (
     chart_layout,
     current_database,
     empty_state,
+    loading,
+    navigate_to,
     page_header,
 )
 from loss_intelligence.app.formatting import (
     alert_type_label,
+    condition_label,
     format_currency,
     format_datetime,
     format_int,
     humanize,
+    inspection_label,
     priority_label,
+    reason_label,
     scope_label,
     status_label,
+)
+
+SHIPMENT_STATUS_OPTIONS = (
+    None,
+    "created",
+    "in_transit",
+    "delivered",
+    "returned",
+    "cancelled",
+    "lost",
+    "unknown",
 )
 
 
@@ -142,6 +158,14 @@ def _render_incidents(incidents: list[dict]) -> None:
         lambda row: format_currency(row["estimated_loss_amount"], row["currency_code"]),
         axis=1,
     )
+    frame["related_event_text"] = frame.apply(
+        lambda row: (
+            f"#{int(row['related_event_sequence'])} {row['related_event_code']}"
+            if pd.notna(row.get("related_event_sequence")) and row.get("related_event_code")
+            else ("Linked" if row.get("related_event_id") else "—")
+        ),
+        axis=1,
+    )
     st.dataframe(
         frame[
             [
@@ -149,6 +173,7 @@ def _render_incidents(incidents: list[dict]) -> None:
                 "damage_type",
                 "severity",
                 "incident_status",
+                "related_event_text",
                 "reported_at_text",
                 "confirmed_at_text",
                 "loss_text",
@@ -161,6 +186,7 @@ def _render_incidents(incidents: list[dict]) -> None:
                 "damage_type": "Damage",
                 "severity": "Severity",
                 "incident_status": "Status",
+                "related_event_text": "Related event",
                 "reported_at_text": "Reported",
                 "confirmed_at_text": "Confirmed",
                 "loss_text": "Estimated loss",
@@ -173,7 +199,44 @@ def _render_incidents(incidents: list[dict]) -> None:
     )
 
 
-def _render_alerts(alerts: list[dict]) -> None:
+def _render_returns(returns: list[dict]) -> None:
+    st.subheader("Returns")
+    if not returns:
+        st.caption("No return records are associated with this shipment.")
+        return
+    frame = pd.DataFrame(returns)
+    frame["initiated_text"] = frame["initiated_at"].apply(format_datetime)
+    frame["received_text"] = frame["received_at"].apply(format_datetime)
+    frame["reason_text"] = frame["declared_reason"].apply(reason_label)
+    frame["inspection_text"] = frame["inspection_outcome"].apply(inspection_label)
+    frame["status_text"] = frame["return_status"].apply(humanize)
+    frame["condition_text"] = frame["condition_on_return"].apply(condition_label)
+    st.dataframe(
+        frame[
+            [
+                "initiated_text",
+                "received_text",
+                "status_text",
+                "reason_text",
+                "inspection_text",
+                "condition_text",
+            ]
+        ].rename(
+            columns={
+                "initiated_text": "Initiated",
+                "received_text": "Received",
+                "status_text": "Status",
+                "reason_text": "Declared reason",
+                "inspection_text": "Inspection",
+                "condition_text": "Condition",
+            }
+        ),
+        hide_index=True,
+        width="stretch",
+    )
+
+
+def _render_alerts(alerts: list[dict], *, key_prefix: str) -> None:
     st.subheader("Associated alerts")
     if not alerts:
         st.caption("No alert evidence links this shipment to an alert.")
@@ -212,6 +275,22 @@ def _render_alerts(alerts: list[dict]) -> None:
         hide_index=True,
         width="stretch",
     )
+    selected_alert = st.selectbox(
+        "Open associated alert",
+        options=[row["alert_id"] for row in alerts],
+        format_func=lambda value: next(
+            (
+                f"{str(row['alert_id'])[:8]} · {alert_type_label(row['alert_type'])} · "
+                f"{row['scope_name'] or ''}"
+                for row in alerts
+                if row["alert_id"] == value
+            ),
+            str(value),
+        ),
+        key=f"{key_prefix}_alert_select",
+    )
+    if st.button("Open in Alerts & Anomalies →", key=f"{key_prefix}_open_alert"):
+        navigate_to("alerts", nav_alert_id=selected_alert)
 
 
 def render_shipment_block(database: str, shipment_id: UUID) -> None:
@@ -226,7 +305,9 @@ def render_shipment_block(database: str, shipment_id: UUID) -> None:
     st.divider()
     _render_incidents(cache.shipment_incidents(database, shipment_id))
     st.divider()
-    _render_alerts(cache.shipment_alerts(database, shipment_id))
+    _render_returns(cache.shipment_returns(database, shipment_id))
+    st.divider()
+    _render_alerts(cache.shipment_alerts(database, shipment_id), key_prefix=f"ship_{shipment_id}")
     st.caption(
         "This operational view does not expose hidden synthetic ground-truth labels or "
         "scenario membership."
@@ -239,14 +320,55 @@ def render() -> None:
         "Search a shipment, inspect its event timeline and see associated incidents and alerts.",
     )
     database = current_database()
-    query = st.text_input(
-        "Shipment code or ID",
-        placeholder="e.g. SHP-000000000000 or a shipment UUID",
-        key="shipment_search_query",
-    )
+    select_key = f"shipment_selected_{database}"
+
+    nav_shipment_id = st.session_state.pop("nav_shipment_id", None)
+    if nav_shipment_id is not None:
+        st.session_state[select_key] = nav_shipment_id
+        st.session_state.pop("shipment_search_query", None)
+        st.session_state.pop("shipment_status_filter", None)
+        st.session_state.pop("shipment_damaged_only", None)
+
+    search_col, status_col, damage_col = st.columns([3, 1, 1])
+    with search_col:
+        query = st.text_input(
+            "Shipment code or ID",
+            placeholder="e.g. SHP-000000000000 or a shipment UUID",
+            key="shipment_search_query",
+        )
+    with status_col:
+        status_filter = st.selectbox(
+            "Status",
+            options=SHIPMENT_STATUS_OPTIONS,
+            format_func=lambda value: "All statuses" if value is None else humanize(value),
+            key="shipment_status_filter",
+        )
+    with damage_col:
+        damaged_only = st.checkbox(
+            "Confirmed damage only",
+            key="shipment_damaged_only",
+        )
 
     try:
-        results = cache.shipment_search(database, query or None, limit=50)
+        with loading("Searching shipments..."):
+            results = cache.shipment_search(
+                database,
+                query or None,
+                status=status_filter,
+                damaged_only=damaged_only,
+                limit=50,
+            )
+            pinned_id = st.session_state.get(select_key)
+            if (
+                pinned_id is not None
+                and not query
+                and status_filter is None
+                and not damaged_only
+                and all(row["shipment_id"] != pinned_id for row in results)
+            ):
+                pinned = cache.shipment_detail(database, pinned_id)
+                if pinned is not None:
+                    results = [pinned, *results]
     except Exception as exc:  # pragma: no cover - surfaced in the UI
         st.error(f"Could not search shipments: {exc}")
         return
@@ -285,12 +407,18 @@ def render() -> None:
         width="stretch",
     )
 
+    shipment_options = [row["shipment_id"] for row in results]
+    if select_key in st.session_state and st.session_state[select_key] not in shipment_options:
+        st.session_state[select_key] = shipment_options[0]
+
     selected_id = st.selectbox(
         "Select a shipment",
-        options=[row["shipment_id"] for row in results],
+        options=shipment_options,
         format_func=lambda value: next(
-            row["shipment_code"] for row in results if row["shipment_id"] == value
+            (row["shipment_code"] for row in results if row["shipment_id"] == value),
+            str(value),
         ),
+        key=select_key,
     )
     st.divider()
     render_shipment_block(database, selected_id)
