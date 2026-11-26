@@ -59,6 +59,27 @@ The loader normally truncates its target before loading. The command above uses
 destructive resets. Migration `001` remains unchanged; schema changes continue through the
 existing later migrations.
 
+Run detection after loading so the Alerts & Anomalies and Model & Evaluation pages are
+populated. The fixture profile includes validation scenarios, so the validation run is
+appropriate for a demo dataset:
+
+```bash
+APP_ENV=production DATABASE_URL='postgresql+psycopg://…?sslmode=require' \
+  uv run python -m loss_intelligence.detection.cli run-validation --database main
+```
+
+## Verification
+
+After the app is deployed:
+
+- The persistent synthetic-data notice is visible.
+- Operations Overview shows the loaded cohort and its denominators.
+- Alerts & Anomalies shows the alerts created by the detection run.
+- Model & Evaluation shows the completed detection run and its held-out metrics.
+
+The sidebar exposes a `test` database target only outside production. In production,
+`TEST_DATABASE_URL` is not required and should not point at the shared demo database.
+
 ## Cloudflare cost boundary
 
 Do not deploy the Streamlit process as an always-on Cloudflare Container to minimize

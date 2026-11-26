@@ -9,6 +9,7 @@ import streamlit as st
 
 from loss_intelligence.app import cache
 from loss_intelligence.app.formatting import format_datetime, format_int
+from loss_intelligence.config import get_settings
 
 DISCLAIMER = (
     "**Synthetic data — independent proof of concept.** This dashboard uses generated "
@@ -108,9 +109,10 @@ def render_sidebar() -> None:
     st.sidebar.title("Loss Intelligence")
     st.sidebar.caption("Synthetic-data PoC · Phase 5 dashboard")
 
+    database_options = ("main",) if get_settings().app_env == "production" else ("main", "test")
     database = st.sidebar.selectbox(
         "Database",
-        ("main", "test"),
+        database_options,
         key="db_target",
         help=(
             "The main database is the demo dataset. The test database is used by integration tests."
